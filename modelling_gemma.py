@@ -6,37 +6,83 @@ import math
 from modeling_siglip import SiglipVisionConfig, SiglipVisionModel
 
 class KVCache():
-
+    """
+    Key-Value Cache for transformer models to store previous attention computations.
+    This optimization prevents recomputing attention for tokens we've already processed,
+    making text generation more efficient.
+    """
+    
     def __init__(self) -> None:
+        """
+        Initialize empty cache for storing key and value states.
+        
+        key_cache: Stores key tensors for each transformer layer
+        value_cache: Stores corresponding value tensors for each layer
+        Both are implemented as lists where each index corresponds to a layer
+        """
         self.key_cache: List[torch.Tensor] = []
         self.value_cache: List[torch.Tensor] = []
-    
+   
     def num_items(self) -> int:
+        """
+        Returns the number of tokens currently stored in the cache.
+        
+        Returns:
+            int: Number of cached tokens (sequence length) or 0 if cache is empty
+            
+        Note: We only need to check key_cache since key and value caches always have same length
+        """
         if len(self.key_cache) == 0:
             return 0
         else:
             # The shape of the key_cache is [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
+            # We return Seq_Len which is the third dimension (index -2)
             return self.key_cache[0].shape[-2]
 
     def update(
         self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
+        key_states: torch.Tensor,    # New key states to be added
+        value_states: torch.Tensor,  # New value states to be added
+        layer_idx: int,              # Index of the transformer layer
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Updates the cache with new key and value states for a specific layer.
+        
+        Args:
+            key_states: New key tensors to add to cache
+            value_states: New value tensors to add to cache
+            layer_idx: Which transformer layer these states belong to
+            
+        Returns:
+            Tuple containing:
+            - Complete key states (cached + new) for the layer
+            - Complete value states (cached + new) for the layer
+            
+        Shape of tensors:
+        - key_states: [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
+        - value_states: [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
+        """
+        
         if len(self.key_cache) <= layer_idx:
-            # If we never added anything to the KV-Cache of this layer, let's create it.
+            # First time we're seeing this layer - initialize its cache
+            # Simply store the new states as they are
             self.key_cache.append(key_states)
             self.value_cache.append(value_states)
         else:
-            # ... otherwise we concatenate the new keys with the existing ones.
-            # each tensor has shape: [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
-            self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
-            self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
-
-        # ... and then we return all the existing keys + the new ones.
+            # We already have cached states for this layer
+            # Concatenate new states with cached states along sequence length dimension
+            # This effectively extends our memory of previous tokens
+            self.key_cache[layer_idx] = torch.cat(
+                [self.key_cache[layer_idx], key_states], 
+                dim=-2  # Concatenate along sequence length dimension
+            )
+            self.value_cache[layer_idx] = torch.cat(
+                [self.value_cache[layer_idx], value_states], 
+                dim=-2  # Concatenate along sequence length dimension
+            )
+            
+        # Return the complete states (cached + new) for this layer
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
-
 class GemmaConfig():
 
     def __init__(
@@ -122,56 +168,121 @@ class GemmaRMSNorm(nn.Module):
         return output.type_as(x)
 
 class GemmaRotaryEmbedding(nn.Module):
+    """
+    Implements Rotary Position Embedding (RoPE) for transformer models.
+    RoPE encodes position information directly into the attention computation
+    through rotation matrices, allowing better handling of relative positions.
+    """
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+        """
+        Initialize the RoPE module.
+        
+        Args:
+            dim: Hidden dimension size (head_dim in attention)
+            max_position_embeddings: Maximum sequence length to support
+            base: Base for the frequency calculations (affects how position information scales)
+        """
         super().__init__()
-
-        self.dim = dim # it is set to the head_dim
+        self.dim = dim  # Set to the head_dim from attention
         self.max_position_embeddings = max_position_embeddings
         self.base = base
-
-        # Calculate the theta according to the formula theta_i = base^(2i/dim) where i = 0, 1, 2, ..., dim // 2
+        
+        # Calculate frequencies for rotation
+        # Formula: θᵢ = base^(-2i/dim) where i = 0, 1, ..., dim/2 - 1
+        # These frequencies determine how fast each dimension rotates with position
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim))
+        
+        # Register frequencies as a buffer (not a parameter)
         self.register_buffer("inv_freq", tensor=inv_freq, persistent=False)
 
     @torch.no_grad()
     def forward(self, x, position_ids, seq_len=None):
-        # x: [bs, num_attention_heads, seq_len, head_size]
+        """
+        Compute the cos and sin values for rotary embeddings.
+        
+        Args:
+            x: Input tensor [batch_size, num_attention_heads, seq_len, head_size]
+            position_ids: Position indices [batch_size, seq_len]
+            seq_len: Optional sequence length
+            
+        Returns:
+            cos, sin tensors for rotating query and key vectors
+        """
+        # Ensure frequencies are on same device as input
         self.inv_freq.to(x.device)
-        # Copy the inv_freq tensor for batch in the sequence
-        # inv_freq_expanded: [Batch_Size, Head_Dim // 2, 1]
+        
+        # Expand frequencies for batch processing
+        # Shape: [batch_size, dim//2, 1]
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-        # position_ids_expanded: [Batch_Size, 1, Seq_Len]
+        
+        # Expand position IDs
+        # Shape: [batch_size, 1, seq_len]
         position_ids_expanded = position_ids[:, None, :].float()
+        
+        # Handle different device types (especially for Apple Silicon)
         device_type = x.device.type
         device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        
+        # Compute rotation frequencies for each position
         with torch.autocast(device_type=device_type, enabled=False):
-            # Multiply each theta by the position (which is the argument of the sin and cos functions)
-            # freqs: [Batch_Size, Head_Dim // 2, 1] @ [Batch_Size, 1, Seq_Len] --> [Batch_Size, Seq_Len, Head_Dim // 2]
+            # Matrix multiply to get frequencies for each position
+            # Shape: [batch_size, seq_len, dim//2]
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-            # emb: [Batch_Size, Seq_Len, Head_Dim]
+            
+            # Duplicate frequencies for full dimension
+            # Shape: [batch_size, seq_len, dim]
             emb = torch.cat((freqs, freqs), dim=-1)
-            # cos, sin: [Batch_Size, Seq_Len, Head_Dim]
+            
+            # Compute cos and sin values
+            # Shape: [batch_size, seq_len, dim]
             cos = emb.cos()
             sin = emb.sin()
+            
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
-
 def rotate_half(x):
-    # Build the [-x2, x1, -x4, x3, ...] tensor for the sin part of the positional encoding.
-    x1 = x[..., : x.shape[-1] // 2] # Takes the first half of the last dimension
-    x2 = x[..., x.shape[-1] // 2 :] # Takes the second half of the last dimension
+    """
+    Helper function to create interleaved negative-positive pairs.
+    For a vector [x1, x2, x3, x4], returns [-x2, x1, -x4, x3].
+    
+    This is used in RoPE to create the rotation effect.
+    """
+    # Split the last dimension in half
+    x1 = x[..., : x.shape[-1] // 2]  # First half
+    x2 = x[..., x.shape[-1] // 2 :]  # Second half
+    # Concatenate with alternating signs
     return torch.cat((-x2, x1), dim=-1)
 
-
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    cos = cos.unsqueeze(unsqueeze_dim) # Add the head dimension
-    sin = sin.unsqueeze(unsqueeze_dim) # Add the head dimension
-    # Apply the formula (34) of the Rotary Positional Encoding paper.
+    """
+    Apply rotary position embeddings to query and key tensors.
+    
+    The rotation is applied using the formula:
+    [cos θ  -sin θ] [x]
+    [sin θ   cos θ] [y]
+    
+    Args:
+        q: Query tensor
+        k: Key tensor
+        cos: Cosine of rotation angles
+        sin: Sine of rotation angles
+        unsqueeze_dim: Dimension to add for broadcasting
+        
+    Returns:
+        Rotated query and key tensors
+    """
+    # Add head dimension for broadcasting
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    
+    # Apply rotation using the formula from RoPE paper
+    # For each vector [x, y]:
+    # x_rotated = x * cos - y * sin
+    # y_rotated = x * sin + y * cos
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
+    
     return q_embed, k_embed
-
-
 class GemmaMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -191,36 +302,77 @@ class GemmaMLP(nn.Module):
         # z = self.down_proj(z) # [Batch_Size, Seq_Len, Intermediate_Size] -> [Batch_Size, Seq_Len, Hidden_Size]
         return self.down_proj(nn.functional.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x))
 
+# Theory: Grouped Query Attention (GQA)
+# GQA is an optimization of the standard attention mechanism where we use fewer key-value heads
+# than query heads. This reduces memory usage and computational cost while maintaining model quality.
+# Each key-value head is shared across multiple query heads, implemented through the repeat_kv function.
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    Repeats key-value heads to match the number of query heads in Grouped Query Attention.
+    
+    Args:
+        hidden_states: Tensor of shape [batch, num_kv_heads, seq_len, head_dim]
+        n_rep: Number of times to repeat each key-value head
+    
+    Returns:
+        Tensor of shape [batch, num_kv_heads * n_rep, seq_len, head_dim]
+    """
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
+    if n_rep == 1:  # If no repetition needed, return as is
         return hidden_states
+    # Add a new dimension and expand (repeat) along it
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    # Reshape to combine the kv_heads and repetition dimensions
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
+# Theory: Multi-head Attention
+# Multi-head attention allows the model to jointly attend to information from different 
+# representation subspaces at different positions. Each head can focus on different aspects
+# of the input, making the model more expressive.
+
 class GemmaAttention(nn.Module):
+    """
+    Implements the attention mechanism for the Gemma model, using Grouped Query Attention (GQA)
+    and Rotary Position Embeddings (RoPE).
+    """
 
     def __init__(self, config: GemmaConfig, layer_idx: Optional[int] = None):
+        """
+        Initialize the attention module with the given configuration.
+        
+        Args:
+            config: Configuration object containing model hyperparameters
+            layer_idx: Index of this layer in the transformer stack
+        """
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
 
+        # Extract configuration parameters
         self.attention_dropout = config.attention_dropout
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = config.head_dim
-        self.num_key_value_heads = config.num_key_value_heads
+        self.hidden_size = config.hidden_size  # Total size of the hidden representations
+        self.num_heads = config.num_attention_heads  # Number of query heads
+        self.head_dim = config.head_dim  # Dimension of each attention head
+        self.num_key_value_heads = config.num_key_value_heads  # Number of key-value heads (fewer than query heads)
+        # Calculate how many query heads share each key-value head
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
-        self.is_causal = True
+        self.rope_theta = config.rope_theta  # Base for rotary position embeddings
+        self.is_causal = True  # Use causal attention mask (can't look at future tokens)
 
+        # Verify that the hidden size is divisible by the number of heads
         assert self.hidden_size % self.num_heads == 0            
 
+        # Initialize the projection matrices
+        # Q, K, V projections transform the input hidden states into query, key, and value representations
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        # Output projection combines the attention outputs back to hidden_size
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+        
+        # Initialize rotary position embeddings
         self.rotary_emb = GemmaRotaryEmbedding(
             self.head_dim,
             max_position_embeddings=self.max_position_embeddings,
@@ -235,59 +387,76 @@ class GemmaAttention(nn.Module):
         kv_cache: Optional[KVCache] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size() # [Batch_Size, Seq_Len, Hidden_Size]
-        # [Batch_Size, Seq_Len, Num_Heads_Q * Head_Dim]
-        query_states = self.q_proj(hidden_states)
-        # [Batch_Size, Seq_Len, Num_Heads_KV * Head_Dim]
-        key_states = self.k_proj(hidden_states)
-        # [Batch_Size, Seq_Len, Num_Heads_KV * Head_Dim]
-        value_states = self.v_proj(hidden_states)
-        # [Batch_Size, Num_Heads_Q, Seq_Len, Head_Dim]
+        """
+        Forward pass of the attention mechanism.
+        
+        Args:
+            hidden_states: Input tensor of shape [batch_size, seq_len, hidden_size]
+            attention_mask: Mask to prevent attention to certain positions
+            position_ids: Indices of positions for rotary embeddings
+            kv_cache: Optional cache for key and value states in inference
+        """
+        # Get batch size, sequence length, and hidden size
+        bsz, q_len, _ = hidden_states.size()
+
+        # 1. Project input hidden states to query, key, and value states
+        query_states = self.q_proj(hidden_states)  # [batch_size, seq_len, num_heads * head_dim]
+        key_states = self.k_proj(hidden_states)    # [batch_size, seq_len, num_kv_heads * head_dim]
+        value_states = self.v_proj(hidden_states)  # [batch_size, seq_len, num_kv_heads * head_dim]
+
+        # 2. Reshape and transpose for attention computation
+        # Separate heads and move head dimension before sequence length
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        # [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        # [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        # [Batch_Size, Seq_Len, Head_Dim], [Batch_Size, Seq_Len, Head_Dim]
+        # 3. Apply rotary position embeddings (RoPE)
+        # RoPE provides relative positional information by rotating vectors in complex space
         cos, sin = self.rotary_emb(value_states, position_ids, seq_len=None)
-        # [Batch_Size, Num_Heads_Q, Seq_Len, Head_Dim], [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
+        # 4. Use cached key-value states if provided (for efficient inference)
         if kv_cache is not None:
             key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx)
 
-        # Repeat the key and values to match the number of heads of the query
+        # 5. Implement Grouped Query Attention
+        # Repeat key-value heads to match number of query heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
-        # Perform the calculation as usual, Q * K^T / sqrt(head_dim). Shape: [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
+
+        # 6. Compute attention scores
+        # Scaled dot-product attention: Q * K^T / sqrt(head_dim)
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
+        # 7. Apply attention mask
         assert attention_mask is not None
         attn_weights = attn_weights + attention_mask
 
-        # Apply the softmax
-        # [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
+        # 8. Apply softmax to get attention probabilities
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        # Apply the dropout
+        
+        # 9. Apply attention dropout
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        # Multiply by the values. [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV] x [Batch_Size, Num_Heads_KV, Seq_Len_KV, Head_Dim] -> [Batch_Size, Num_Heads_Q, Seq_Len_Q, Head_Dim]
+
+        # 10. Compute weighted sum of values
         attn_output = torch.matmul(attn_weights, value_states)
 
+        # 11. Verify output shape
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
                 f" {attn_output.size()}"
             )
-        # Make sure the sequence length is the second dimension. # [Batch_Size, Num_Heads_Q, Seq_Len_Q, Head_Dim] -> [Batch_Size, Seq_Len_Q, Num_Heads_Q, Head_Dim]
+
+        # 12. Reshape attention output
+        # Transpose and reshape to combine all heads
         attn_output = attn_output.transpose(1, 2).contiguous()
-        # Concatenate all the heads together. [Batch_Size, Seq_Len_Q, Num_Heads_Q, Head_Dim] -> [Batch_Size, Seq_Len_Q, Num_Heads_Q * Head_Dim]
         attn_output = attn_output.view(bsz, q_len, -1)
-        # Multiply by W_o. [Batch_Size, Seq_Len_Q, Hidden_Size]
+
+        # 13. Project back to model dimension
         attn_output = self.o_proj(attn_output)
 
         return attn_output, attn_weights
-
 class GemmaDecoderLayer(nn.Module):
 
     def __init__(self, config: GemmaConfig, layer_idx: int):
